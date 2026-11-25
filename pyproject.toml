@@ -1,0 +1,18 @@
+[project]
+name = "bc_extractor"
+version = "0.1.0"
+description = "Interactively select a ZIP file, extract the unclipped sequences, and extract barcodes."
+requires-python = ">=3.12"
+dependencies = [
+    "biopython>=1.87",
+    "ipykernel>=7.3.0",
+    "matplotlib>=3.11.0",
+    "regex>=2026.5.9",
+    "seaborn>=0.13.2",
+]   # standard library only (zipfile, tkinter, pathlib)
+
+[tool.uv]
+# Prefer uv-managed Python builds: they ship with a working tkinter,
+# unlike some distro / Homebrew Pythons where it's a separate package.
+python-preference = "managed"
+package = false     # this is a script project, not an installable package
