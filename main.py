@@ -35,8 +35,8 @@ from utils.barcode_extractor import extract_barcodes
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class BarcodeParams:
-    upstream_seq: str = "GGTCTCT"
-    downstream_seq: str = "CGTACGC"
+    upstream_seq: str = "GAGGTCTCT"
+    downstream_seq: str = "CGTACGCTG"
     min_len: int = 10
     max_len: int = 23
     max_errors: int = 2

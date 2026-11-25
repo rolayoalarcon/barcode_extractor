@@ -11,16 +11,15 @@ except ImportError:  # pragma: no cover
     HAVE_FUZZY = False
 
 
-
 def build_pattern(upstream, downstream, min_len, max_len, max_errors):
     """Compile a pattern that captures the barcode between the two flanks.
- 
+
     The barcode group is bounded to [min_len, max_len] of nucleotide
     characters. With the `regex` module and max_errors > 0, each flank is
-    matched allowing up to `max_errors` substitutions/indels.
+    matched allowing up to `max_errors` substitutions.
     """
     barcode = f"(?P<bc>[ACGTacgt]{{{min_len},{max_len}}})"
- 
+
     if HAVE_FUZZY and max_errors > 0:
         up = f"(?:{upstream}){{s<={max_errors}}}"
         down = f"(?:{downstream}){{s<={max_errors}}}"
@@ -31,39 +30,62 @@ def build_pattern(upstream, downstream, min_len, max_len, max_errors):
                 "EXACT flank matching (--max-errors ignored).\n"
             )
         up, down = upstream, downstream
- 
-    return _re.compile(up + barcode + down, _re.IGNORECASE)
+
+    flags = _re.IGNORECASE
+    if HAVE_FUZZY:
+        # Without BESTMATCH, `regex` returns the LEFTMOST match within the error
+        # budget, which can be a worse alignment that shifts the flank and pulls
+        # flank bases into the barcode. BESTMATCH returns the fewest-error match.
+        # NB: it must be a compile flag; `pattern.search(s, BESTMATCH)` would
+        # pass it as the `pos` argument (= 4096) and search from that offset.
+        flags |= _re.BESTMATCH
+    return _re.compile(up + barcode + down, flags)
+
 
 def find_barcode(seq, pattern):
     """Search forward strand then reverse complement.
- 
-    Returns (barcode, strand) or (None, None) if no match on either strand.
+
+    Returns (barcode, strand, start, end) or (None, None, None, None).
+
+    `start`/`end` are 0-based, end-exclusive coordinates on the ORIGINAL read
+    (as written in the FASTA), so `str(seq[start:end])` is the barcode region
+    on the forward strand. For '-' hits the reported barcode is the reverse
+    complement of that region (i.e. read in the orientation it was matched).
     """
+    read_len = len(seq)
     candidates = (("+", seq), ("-", seq.reverse_complement()))
     for strand, oriented in candidates:
         s = str(oriented)
-        # BESTMATCH (regex module) returns the match with the fewest errors,
-        # which matters when fuzzy matching could find several alignments.
-        if HAVE_FUZZY:
-            #m = pattern.search(s, _re.BESTMATCH)
-            m = pattern.search(s)
-        else:
-            m = pattern.search(s)
+        m = pattern.search(s)  # BESTMATCH is set at compile time (see build_pattern)
         if m:
-            return m.group("bc").upper(), strand
-    return None, None
+            # Span of the barcode group itself, in the searched orientation
+            s_start, s_end = m.span("bc")
+            if strand == "+":
+                start, end = s_start, s_end
+            else:
+                # Map reverse-complement coordinates back to the original read:
+                # position i in revcomp <-> position (L - 1 - i) in the read,
+                # so the half-open interval [a, b) becomes [L - b, L - a).
+                start, end = read_len - s_end, read_len - s_start
+            return m.group("bc").upper(), strand, start, end
+    return None, None, None, None
 
 
-def extract_barcodes(input_fasta: Path, 
-                     output_prefix: str, 
+def extract_barcodes(input_fasta: Path,
+                     output_prefix: str,
                      upstream_seq: str,
                      downstream_seq: str,
                      min_len: int = 10,
                      max_len: int = 30,
                      max_errors: int = 2) -> Path:
     """
-    Extracts the first `barcode_length` bases from each sequence in the input FASTA file
-    and writes them to the output FASTA file.
+    Extract the barcode between `upstream_seq` and `downstream_seq` from each
+    sequence in the input FASTA, writing a TSV report and a FASTA of barcodes.
+
+    TSV columns:
+        read_id, strand, barcode, bc_start, bc_end
+    where bc_start/bc_end are 0-based, end-exclusive positions on the original
+    read (Python slice / BED convention; barcode length = bc_end - bc_start).
 
     Args:
         input_fasta (Path): Path to the input FASTA file.
@@ -72,40 +94,33 @@ def extract_barcodes(input_fasta: Path,
         downstream_seq (str): The downstream sequence to match.
         min_len (int): The minimum length of the barcode.
         max_len (int): The maximum length of the barcode.
-        max_errors (int): The maximum number of errors allowed in the flanks.
+        max_errors (int): The maximum number of substitutions allowed in each flank.
 
     Returns:
-        Path: Path to the output FASTA file.
+        Path: Path to the output TSV file.
     """
 
     # Build the regex pattern for barcode extraction
     pattern = build_pattern(upstream_seq, downstream_seq, min_len, max_len, max_errors)
 
-    # Determine the output directory and create it if it doesn't exist
-    OUTPUT_DIRECTORY = input_fasta.parent
-
-    out = open(input_fasta.parent / f"{output_prefix}_barcodes.tsv", "w")
-    fa_out = open(input_fasta.parent / f"{output_prefix}_barcodes.fasta", "w")
+    tsv_path = input_fasta.parent / f"{output_prefix}_barcodes.tsv"
+    fasta_path = input_fasta.parent / f"{output_prefix}_barcodes.fasta"
 
     n_total = 0
     n_found = 0
-    try:
+    with open(tsv_path, "w") as out, open(fasta_path, "w") as fa_out:
+        out.write("read_id\tstrand\tbarcode\tbc_start\tbc_end\n")
         for rec in SeqIO.parse(input_fasta, "fasta"):
             n_total += 1
-            bc, strand = find_barcode(rec.seq, pattern)
+            bc, strand, start, end = find_barcode(rec.seq, pattern)
             if bc is None:
                 # No anchor found on either strand; record as NA so you can
                 # audit your recovery rate rather than silently dropping reads.
-                out.write(f"{rec.id}\tNA\tNA\n")
+                out.write(f"{rec.id}\tNA\tNA\tNA\tNA\n")
                 continue
             n_found += 1
-            out.write(f"{rec.id}\t{strand}\t{bc}\n")
-            if fa_out:
-                fa_out.write(f">{rec.id} strand={strand}\n{bc}\n")
-    finally:
-        if out is not sys.stdout:
-            out.close()
-        if fa_out:
-            fa_out.close()
+            out.write(f"{rec.id}\t{strand}\t{bc}\t{start}\t{end}\n")
+            fa_out.write(f">{rec.id} strand={strand} start={start} end={end}\n{bc}\n")
 
-    
+    print(f"Barcodes found in {n_found}/{n_total} reads -> {tsv_path}")
+    return tsv_path
